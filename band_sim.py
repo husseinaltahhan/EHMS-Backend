@@ -26,7 +26,7 @@ def main() -> None:
     ap.add_argument("--host", default="localhost")
     ap.add_argument("--port", type=int, default=1883)
     ap.add_argument("--band", default="band1")
-    ap.add_argument("--mode", default="normal", choices=["normal", "tachy", "hypoxia", "noisy"])
+    ap.add_argument("--mode", default="tachy", choices=["normal", "tachy", "hypoxia", "noisy"])
     ap.add_argument("--interval", type=float, default=1.0)
     a = ap.parse_args()
 

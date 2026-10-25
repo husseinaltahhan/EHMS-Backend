@@ -1,4 +1,4 @@
-"""EHMS backend: band sends vitals over MQTT -> detector checks them -> dashboard gets them over WebSocket."""
+"""EHMS backend: band sends vitals over MQTT -> detector checks them -> dashboard gets them over WebSocket -> saved to Supabase."""
 import asyncio
 import json
 import time
@@ -7,6 +7,7 @@ from contextlib import asynccontextmanager
 import paho.mqtt.client as mqtt
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 
+import db
 from detector import Detector
 
 # --- Settings ---
@@ -15,8 +16,20 @@ MQTT_PORT = 1883
 MQTT_TOPIC = "zigbee2mqtt/+"  # + means "any band"
 
 # --- State (lives in memory) ---
-BAND_AGE_GROUPS = {"band1": "adult"}  # which age group each band's patient is in; unknown bands = adult
+BAND_AGE_GROUPS = {"band1": "adult", 
+                   "band2": "child",
+                   "band3": "adult",
+                   "band4": "elderly",
+                   "band5": "adult"
+                   }  # which age group each band's patient is in; unknown bands = adult
+BAND_PATIENTS = {"band1": {"name": "John Doe", "sex": "Male", "age": 45}, 
+                 "band2": {"name": "Mahir Jr", "sex": "Male", "age": 5},
+                 "band3": {"name": "Peter Griffyn", "sex": "Male", "age": 35},
+                 "band4": {"name": "Jane Doe", "sex": "Female", "age": 70},
+                 "band5": {"name": "Miley Cirus", "sex": "Female", "age": 37}
+                 }  # shown on the dashboard card
 active_alerts = {}                    # (band_id, metric) -> alert
+latest_samples = {}                   # band_id -> most recent sample, so new dashboards start filled in
 dashboards = set()                    # open WebSocket connections
 detector = Detector()
 
@@ -32,6 +45,8 @@ async def broadcast(message):
 
 # --- The core flow: one reading in, alerts out ---
 async def handle_sample(sample):
+    sample["patient"] = BAND_PATIENTS.get(sample["band_id"])
+    latest_samples[sample["band_id"]] = sample
     await broadcast({"type": "sample", "sample": sample})
     for event in detector.process(sample, BAND_AGE_GROUPS.get(sample["band_id"], "adult")):
         key = (event["alert"]["band_id"], event["alert"]["metric"])
@@ -40,7 +55,16 @@ async def handle_sample(sample):
         else:
             active_alerts.pop(key, None)
         print(f"ALERT {event['type']}: {event['alert']}")
+        try:
+            await asyncio.to_thread(db.save_events, sample, sample["patient"], event['type'], event['alert'])
+        except Exception as e:
+            print(f"couln't save event to db for {sample['band_id']}. Error: {e}")
         await broadcast(event)
+    # Save to Supabase last, so a slow or offline database never delays the dashboard.
+    try:
+        await asyncio.to_thread(db.save_vitals, sample, sample["patient"])
+    except Exception as e:
+        print(f"couldn't save vitals for {sample['band_id']}: {e}")
 
 
 # --- Listening to the bands over MQTT ---
@@ -99,6 +123,10 @@ async def list_alerts():
 @app.websocket("/ws")
 async def ws_endpoint(ws: WebSocket):
     await ws.accept()
+    # Catch the new dashboard up on everything it missed before it connected.
+    await ws.send_json({"type": "snapshot",
+                        "samples": list(latest_samples.values()),
+                        "alerts": list(active_alerts.values())})
     dashboards.add(ws)
     try:
         while True:

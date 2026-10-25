@@ -2,3 +2,5 @@ fastapi
 uvicorn[standard]
 paho-mqtt>=2.0
 pytest
+supabase
+python-dotenv
