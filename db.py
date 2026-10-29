@@ -89,3 +89,54 @@ def save_events(sample, patient, alert_type, alert_desc):
         "description" : alert_desc,
         "session_id" : session_id,
     }).execute()
+
+def save_alert(sample, patient, event):
+    """Raised -> new row in alerts marked active. Cleared -> that row is marked resolved."""
+    if client is None:
+        return
+    session_id = get_session_id(sample, patient)
+    if session_id is None:
+        return
+    alert = event["alert"]
+    if event["type"] == "raised":
+        client.table("alerts").insert({
+            "session_id": session_id,
+            "type": alert["metric"],  # hr_high, hr_low or spo2_low
+            "status": "active",
+            "created_at": to_iso(alert["raised_at"]),
+        }).execute()
+    else:
+        # Matched by session and type rather than a saved id, so it still works after a backend restart.
+        (client.table("alerts").update({"status": "resolved", "resolved_at": to_iso(sample["ts"])})
+         .eq("session_id", session_id).eq("type", alert["metric"]).eq("status", "active").execute())
+
+
+def get_sessions():
+    if client is None:
+        return
+    return client.table("sessions").select("*").eq("active", True).execute().data
+
+
+class BandInUse(Exception):
+    """Raised when admitting a patient onto a band that's already on someone."""
+
+
+def create_session(details):
+    """Admits a patient: opens a session on their band. details has the sessions columns (band_id, patient_name, ...)."""
+    if client is None:
+        raise RuntimeError("Supabase isn't configured (check .env)")
+    number = details["band_id"]
+    with session_lock:
+        active = client.table("sessions").select("id, patient_name").eq("band_id", number).eq("active", True).execute().data
+        if active:
+            raise BandInUse(f"Band {number} is already on {active[0]['patient_name']} (session {active[0]['id']})")
+
+        # Sessions need a row in bands first (foreign key). ignore_duplicates leaves an existing band untouched.
+        client.table("bands").upsert({"id": number, "current_charge": 0, "active": True},
+                                     ignore_duplicates=True).execute()
+        session = client.table("sessions").insert({**details, "active": True}).execute().data[0]
+
+        # Point this band's live readings at the new session.
+        for band_id in [b for b in session_ids if band_number(b) == number]:
+            session_ids[band_id] = session["id"]
+        return session

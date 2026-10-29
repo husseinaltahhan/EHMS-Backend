@@ -5,7 +5,8 @@ import time
 from contextlib import asynccontextmanager
 
 import paho.mqtt.client as mqtt
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
+from pydantic import BaseModel, Field
 
 import db
 from detector import Detector
@@ -60,6 +61,10 @@ async def handle_sample(sample):
         except Exception as e:
             print(f"couln't save event to db for {sample['band_id']}. Error: {e}")
         await broadcast(event)
+        try:
+            await asyncio.to_thread(db.save_alert, sample, sample["patient"], event)
+        except Exception as e:
+            print(f"couldn't save alert for {sample['band_id']}: {e}")
     # Save to Supabase last, so a slow or offline database never delays the dashboard.
     try:
         await asyncio.to_thread(db.save_vitals, sample, sample["patient"])
@@ -133,3 +138,41 @@ async def ws_endpoint(ws: WebSocket):
             await ws.receive_text()  # keeps the connection open
     except WebSocketDisconnect:
         dashboards.discard(ws)
+
+@app.get("/patients")
+async def get_patients():
+    try:
+        sessions = db.get_sessions()
+        patients = []
+        for session in sessions:
+            patients.append({
+                "name": session["patient_name"],
+                "age": session["patient_age"],
+                "sex": session["patient_sex"],
+                "admitted_at": session["created_at"],
+            })
+        return patients
+    except Exception as e:
+        print(f"Error retrieving patients: {e}")
+        return {f"error": "Could not retrieve patients. {e}"}
+    
+class NewSession(BaseModel):
+    """What the dashboard sends to admit a patient onto a band."""
+    band_id: int                                          # bands.id, e.g. 1 for zigbee2mqtt/band1
+    patient_name: str
+    patient_age: int = Field(ge=0)
+    patient_sex: str
+    patient_mrn: int | None = None                        # medical record number
+    patient_ctas: int | None = Field(None, ge=1, le=5)    # triage level, 1 = most urgent
+    nurse_id: int | None = None
+
+
+@app.post("/session", status_code=201)
+async def create_session(new: NewSession):
+    try:
+        return await asyncio.to_thread(db.create_session, new.model_dump())
+    except db.BandInUse as e:
+        raise HTTPException(status_code=409, detail=str(e))
+    except Exception as e:
+        print(f"couldn't create session: {e}")
+        raise HTTPException(status_code=500, detail="Could not create session")
